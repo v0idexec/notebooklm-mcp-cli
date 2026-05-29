@@ -2,6 +2,9 @@
 
 import contextlib
 import logging
+import re
+import time
+from pathlib import Path
 
 import typer
 
@@ -61,6 +64,85 @@ from notebooklm_tools.cli.commands.verbs import (
 from notebooklm_tools.cli.utils import make_console
 
 console = make_console()
+
+AUTH_BROWSER_CLOSE_DELAY_SECONDS = 10
+BATCH_EMAIL_RE = re.compile(r"^[^@\s:;,|]+@[^@\s:;,|]+\.[^@\s:;,|]+$")
+
+
+def _close_launched_auth_browser(delay_seconds: int = AUTH_BROWSER_CLOSE_DELAY_SECONDS) -> None:
+    """Keep the auth browser open briefly before closing it."""
+    from notebooklm_tools.utils.cdp import get_browser_display_name, terminate_chrome
+
+    browser_name = get_browser_display_name()
+    if delay_seconds > 0:
+        console.print(
+            f"[dim]Keeping {browser_name} open for "
+            f"{delay_seconds} seconds before closing...[/dim]"
+        )
+        time.sleep(delay_seconds)
+    console.print(f"[dim]Closing {browser_name}...[/dim]")
+    terminate_chrome()
+
+
+def _load_batch_login_emails(accounts_file: Path) -> list[str]:
+    """Load an email-only accounts file for safe batch login."""
+    try:
+        lines = accounts_file.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as e:
+        raise ValueError(f"Could not read accounts file: {e}") from e
+
+    emails: list[str] = []
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if any(separator in line for separator in (":", ",", ";", "|")) or len(line.split()) != 1:
+            raise ValueError(
+                f"Line {line_number}: expected one email address only. "
+                "Password columns are not supported."
+            )
+
+        if not BATCH_EMAIL_RE.fullmatch(line):
+            raise ValueError(f"Line {line_number}: expected a valid email address")
+
+        emails.append(line)
+
+    if not emails:
+        raise ValueError("No email addresses found in accounts file")
+
+    return emails
+
+
+def _next_numeric_profile_index(profile_names: list[str]) -> int:
+    """Return the next profile number after the highest numeric profile name."""
+    numeric_profiles = [int(name) for name in profile_names if name.isdigit()]
+    return max(numeric_profiles, default=0) + 1
+
+
+def _profile_sort_key(profile_name: str) -> tuple[int, int | str]:
+    """Sort numeric profile names naturally before named profiles."""
+    if profile_name.isdigit():
+        return (0, int(profile_name))
+    return (1, profile_name.casefold())
+
+
+def _looks_like_browser_closed_error(error: Exception) -> bool:
+    """Best-effort detection for browser/CDP connection closure errors."""
+    message = str(error).lower()
+    return any(
+        fragment in message
+        for fragment in (
+            "browser window or tab was closed",
+            "browser closed",
+            "connection refused",
+            "connection reset",
+            "connection to remote host was lost",
+            "websocket connection closed",
+            "socket is already closed",
+        )
+    )
+
 
 # Main application
 app = typer.Typer(
@@ -128,6 +210,28 @@ def login_callback(
         "--force",
         help="Force overwrite even if profile has credentials for a different account",
     ),
+    all_profiles: bool = typer.Option(
+        False,
+        "--all-profiles",
+        "--all",
+        help="Authenticate every saved profile in sequence",
+    ),
+    start_index: int | None = typer.Option(
+        None,
+        "--start-index",
+        "--start",
+        help="With --all-profiles, start from this numeric profile and skip lower numbers",
+    ),
+    stop_on_error: bool = typer.Option(
+        False,
+        "--stop-on-error",
+        help="Stop --all-profiles at the first failed profile",
+    ),
+    close_delay: int = typer.Option(
+        AUTH_BROWSER_CLOSE_DELAY_SECONDS,
+        "--close-delay",
+        help="Seconds to keep the browser open after each successful login",
+    ),
     clear: bool = typer.Option(
         False,
         "--clear",
@@ -158,6 +262,38 @@ def login_callback(
     # If a subcommand is invoked, don't run login logic
     if ctx.invoked_subcommand is not None:
         return
+
+    if close_delay < 0:
+        console.print("[red]Error:[/red] --close-delay cannot be negative")
+        raise typer.Exit(1)
+    if start_index is not None and start_index < 1:
+        console.print("[red]Error:[/red] --start-index must be 1 or greater")
+        raise typer.Exit(1)
+
+    if all_profiles:
+        if check or manual:
+            console.print("[red]Error:[/red] --all-profiles cannot be combined with --check or --manual")
+            raise typer.Exit(1)
+        if provider.strip().lower() != "builtin":
+            console.print("[red]Error:[/red] --all-profiles only supports the builtin auth provider")
+            raise typer.Exit(1)
+        if cdp_url != "http://127.0.0.1:18800":
+            console.print("[red]Error:[/red] --all-profiles requires the default builtin CDP endpoint")
+            console.print("[dim]Profile isolation is not available with an external CDP endpoint.[/dim]")
+            raise typer.Exit(1)
+        _login_all_saved_profiles(
+            force=force,
+            clear_profile=clear,
+            close_delay=close_delay,
+            stop_on_error=stop_on_error,
+            start_index=start_index,
+        )
+        return
+
+    if start_index is not None:
+        console.print("[red]Error:[/red] --start-index only works with --all-profiles")
+        console.print("[dim]For batch login, put --start-index after the batch subcommand.[/dim]")
+        raise typer.Exit(1)
 
     # Use config default if no profile specified
     if profile is None:
@@ -436,11 +572,6 @@ def login_callback(
             build_label=build_label,
         )
 
-        # Close builtin auth Chrome to release profile lock (enables headless auth later)
-        if launched_local_chrome:
-            console.print(f"[dim]Closing {get_browser_display_name()}...[/dim]")
-            terminate_chrome()
-
         console.print("\n[green]✓[/green] Successfully authenticated!")
         console.print(f"  Profile: {profile}")
         console.print(f"  Provider: {provider}")
@@ -449,6 +580,11 @@ def login_callback(
         if email:
             console.print(f"  Account: {email}")
         console.print(f"  Credentials saved to: {auth.profile_dir}")
+
+        # Close builtin auth Chrome to release profile lock (enables headless auth later).
+        # Keep it open briefly after auth so the user can see the completed login state.
+        if launched_local_chrome:
+            _close_launched_auth_browser(close_delay)
 
     except AccountMismatchError as e:
         if provider == "builtin" and not force:
@@ -494,10 +630,6 @@ def login_callback(
                     build_label=build_label,
                 )
 
-                if launched_local_chrome:
-                    console.print(f"[dim]Closing {get_browser_display_name()}...[/dim]")
-                    terminate_chrome()
-
                 console.print("\n[green]✓[/green] Successfully authenticated!")
                 console.print(f"  Profile: {profile}")
                 console.print(f"  Provider: {provider}")
@@ -508,6 +640,9 @@ def login_callback(
                 if email:
                     console.print(f"  Account: {email}")
                 console.print(f"  Credentials saved to: {auth.profile_dir}")
+
+                if launched_local_chrome:
+                    _close_launched_auth_browser(close_delay)
             except NLMError as retry_err:
                 console.print(f"\n[red]Error on retry:[/red] {retry_err.message}")
                 if retry_err.hint:
@@ -522,6 +657,289 @@ def login_callback(
         if e.hint:
             console.print(f"\n[dim]Hint: {e.hint}[/dim]")
         raise typer.Exit(1) from e
+
+
+def _login_all_saved_profiles(
+    *,
+    force: bool,
+    clear_profile: bool,
+    close_delay: int,
+    stop_on_error: bool,
+    start_index: int | None,
+) -> None:
+    """Refresh authentication for every saved profile using its isolated browser session."""
+    from notebooklm_tools.core.auth import AuthManager
+    from notebooklm_tools.core.exceptions import BrowserClosedError, NLMError
+    from notebooklm_tools.utils.cdp import extract_cookies_via_cdp, terminate_chrome
+
+    all_profiles = sorted(AuthManager.list_profiles(), key=_profile_sort_key)
+    profiles = all_profiles
+    if start_index is not None:
+        profiles = [name for name in all_profiles if name.isdigit() and int(name) >= start_index]
+
+    if not profiles:
+        if start_index is not None and all_profiles:
+            console.print(
+                f"[red]Error:[/red] No numeric profiles found at or after {start_index}"
+            )
+        else:
+            console.print("[red]Error:[/red] No saved profiles found")
+            console.print("[dim]Run 'nlm login' or 'nlm login batch accounts.txt' first.[/dim]")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]Login all profiles:[/bold] {len(profiles)} profile(s) found")
+    console.print("[yellow]Passwords are never read or automated.[/yellow]")
+    if start_index is not None:
+        console.print(f"[dim]Starting from numeric profile {start_index}[/dim]")
+    if clear_profile:
+        console.print("[yellow]Browser sessions will be cleared before each login.[/yellow]")
+    console.print()
+
+    refreshed_profiles: list[str] = []
+    failed_profiles: list[str] = []
+    skipped_profiles: list[str] = []
+
+    for profile in profiles:
+        auth = AuthManager(profile)
+        expected_email = ""
+
+        console.rule(f"Profile {profile}")
+        try:
+            stored_profile = auth.load_profile()
+            expected_email = (stored_profile.email or "").strip()
+            if expected_email:
+                console.print(f"Expected account: [cyan]{expected_email}[/cyan]")
+        except NLMError as e:
+            failed_profiles.append(profile)
+            console.print(f"[red]Error:[/red] Could not load profile '{profile}': {e.message}")
+            if e.hint:
+                console.print(f"[dim]Hint: {e.hint}[/dim]")
+            if stop_on_error:
+                break
+            console.print("[dim]Skipping profile and moving to the next one.[/dim]")
+            continue
+
+        logged_in = False
+        try:
+            result = extract_cookies_via_cdp(
+                auto_launch=True,
+                wait_for_login=True,
+                login_timeout=300,
+                profile_name=profile,
+                clear_profile=clear_profile,
+                login_hint=expected_email or None,
+            )
+
+            cookies = result["cookies"]
+            csrf_token = result.get("csrf_token", "")
+            session_id = result.get("session_id", "")
+            actual_email = (result.get("email") or "").strip()
+            build_label = result.get("build_label", "")
+
+            if expected_email and actual_email and actual_email.lower() != expected_email.lower() and not force:
+                console.print("[red]Error:[/red] Logged-in account does not match the saved profile")
+                console.print(f"  Expected: {expected_email}")
+                console.print(f"  Browser:  {actual_email}")
+                console.print("[dim]No credentials were saved for this profile.[/dim]")
+                failed_profiles.append(profile)
+                if stop_on_error:
+                    break
+                console.print("[dim]Skipping profile and moving to the next one.[/dim]")
+                continue
+
+            auth.save_profile(
+                cookies=cookies,
+                csrf_token=csrf_token,
+                session_id=session_id,
+                email=actual_email or expected_email,
+                force=force,
+                build_label=build_label,
+            )
+            refreshed_profiles.append(profile)
+            logged_in = True
+
+            console.print("[green]✓[/green] Successfully authenticated")
+            console.print(f"  Profile: {profile}")
+            if actual_email or expected_email:
+                console.print(f"  Account: {actual_email or expected_email}")
+            console.print(f"  Credentials saved to: {auth.profile_dir}")
+        except BrowserClosedError as e:
+            skipped_profiles.append(profile)
+            console.print(f"\n[yellow]Skipped:[/yellow] {e.message}")
+            console.print("[dim]Moving to the next profile.[/dim]")
+            if stop_on_error:
+                break
+        except NLMError as e:
+            failed_profiles.append(profile)
+            console.print(f"\n[red]Error:[/red] {e.message}")
+            if e.hint:
+                console.print(f"\n[dim]Hint: {e.hint}[/dim]")
+            if stop_on_error:
+                break
+            console.print("[dim]Skipping profile and moving to the next one.[/dim]")
+        except Exception as e:
+            if _looks_like_browser_closed_error(e):
+                skipped_profiles.append(profile)
+                console.print("\n[yellow]Skipped:[/yellow] Browser was closed before login completed")
+                console.print("[dim]Moving to the next profile.[/dim]")
+            else:
+                failed_profiles.append(profile)
+                console.print(f"\n[red]Error:[/red] Unexpected authentication error: {e}")
+                if not stop_on_error:
+                    console.print("[dim]Skipping profile and moving to the next one.[/dim]")
+            if stop_on_error:
+                break
+        finally:
+            if logged_in:
+                _close_launched_auth_browser(close_delay)
+            else:
+                terminate_chrome()
+
+    console.rule("Login all profiles complete")
+    console.print(f"[green]✓[/green] Refreshed {len(refreshed_profiles)} profile(s)")
+    if skipped_profiles:
+        console.print(f"[yellow]↷[/yellow] Skipped {len(skipped_profiles)} profile(s): {', '.join(skipped_profiles)}")
+    if failed_profiles:
+        console.print(f"[red]✗[/red] Failed {len(failed_profiles)} profile(s): {', '.join(failed_profiles)}")
+        raise typer.Exit(1)
+
+
+@login_app.command("batch")
+def login_batch(
+    accounts_file: Path = typer.Argument(  # noqa: B008
+        ...,
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Text file containing one email address per line",
+    ),
+    start_index: int | None = typer.Option(
+        None,
+        "--start-index",
+        "--start",
+        help="First numeric profile name to create (default: next after highest existing number)",
+    ),
+    timeout: int = typer.Option(
+        300,
+        "--timeout",
+        help="Seconds to wait for each interactive Google sign-in",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite existing numeric profiles",
+    ),
+    close_delay: int = typer.Option(
+        AUTH_BROWSER_CLOSE_DELAY_SECONDS,
+        "--close-delay",
+        help="Seconds to keep the browser open after each successful login",
+    ),
+) -> None:
+    """Interactively authenticate many accounts from an email-only file.
+
+    Passwords are never read, stored, or typed. The browser opens for each
+    account and the user completes Google sign-in manually.
+    """
+    from notebooklm_tools.core.auth import AuthManager
+    from notebooklm_tools.core.exceptions import NLMError
+    from notebooklm_tools.utils.cdp import extract_cookies_via_cdp, terminate_chrome
+
+    existing_profiles = AuthManager.list_profiles()
+    if start_index is None:
+        start_index = _next_numeric_profile_index(existing_profiles)
+    elif start_index < 1:
+        console.print("[red]Error:[/red] --start-index must be 1 or greater")
+        raise typer.Exit(1)
+    if timeout <= 0:
+        console.print("[red]Error:[/red] --timeout must be greater than 0")
+        raise typer.Exit(1)
+    if close_delay < 0:
+        console.print("[red]Error:[/red] --close-delay cannot be negative")
+        raise typer.Exit(1)
+
+    try:
+        emails = _load_batch_login_emails(accounts_file)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        console.print("[dim]Use one email per line. Do not include passwords.[/dim]")
+        raise typer.Exit(1) from e
+
+    console.print(f"[bold]Batch login:[/bold] {len(emails)} account(s) loaded")
+    console.print("[yellow]Passwords are never read or automated.[/yellow]")
+    console.print(
+        f"[dim]Profiles will be saved as {start_index}, {start_index + 1}, "
+        f"{start_index + 2}, ...[/dim]\n"
+    )
+
+    saved_profiles: list[str] = []
+    for offset, expected_email in enumerate(emails):
+        profile = str(start_index + offset)
+        auth = AuthManager(profile)
+
+        console.rule(f"Profile {profile}")
+        console.print(f"Expected account: [cyan]{expected_email}[/cyan]")
+
+        if auth.profile_exists() and not force:
+            console.print(f"[red]Error:[/red] Profile '{profile}' already exists")
+            console.print("[dim]Use --force to overwrite it, or choose another --start-index.[/dim]")
+            raise typer.Exit(1)
+
+        logged_in = False
+        try:
+            result = extract_cookies_via_cdp(
+                auto_launch=True,
+                wait_for_login=True,
+                login_timeout=timeout,
+                profile_name=profile,
+                clear_profile=True,
+                login_hint=expected_email,
+            )
+
+            cookies = result["cookies"]
+            csrf_token = result.get("csrf_token", "")
+            session_id = result.get("session_id", "")
+            actual_email = (result.get("email") or "").strip()
+            build_label = result.get("build_label", "")
+
+            if actual_email and actual_email.lower() != expected_email.lower():
+                console.print("[red]Error:[/red] Logged-in account does not match the file")
+                console.print(f"  Expected: {expected_email}")
+                console.print(f"  Browser:  {actual_email}")
+                console.print("[dim]No credentials were saved for this profile.[/dim]")
+                raise typer.Exit(1)
+
+            auth.save_profile(
+                cookies=cookies,
+                csrf_token=csrf_token,
+                session_id=session_id,
+                email=actual_email or expected_email,
+                force=force,
+                build_label=build_label,
+            )
+            saved_profiles.append(profile)
+            logged_in = True
+
+            console.print("[green]✓[/green] Successfully authenticated")
+            console.print(f"  Profile: {profile}")
+            console.print(f"  Account: {actual_email or expected_email}")
+            console.print(f"  Credentials saved to: {auth.profile_dir}")
+        except typer.Exit:
+            raise
+        except NLMError as e:
+            console.print(f"\n[red]Error:[/red] {e.message}")
+            if e.hint:
+                console.print(f"\n[dim]Hint: {e.hint}[/dim]")
+            raise typer.Exit(1) from e
+        finally:
+            if logged_in:
+                _close_launched_auth_browser(close_delay)
+            else:
+                terminate_chrome()
+
+    console.rule("Batch login complete")
+    console.print(f"[green]✓[/green] Saved {len(saved_profiles)} profile(s): {', '.join(saved_profiles)}")
+    if saved_profiles:
+        console.print(f"[dim]Switch default profile with: nlm login switch {saved_profiles[0]}[/dim]")
 
 
 @profile_app.command("list")

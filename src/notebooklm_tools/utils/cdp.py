@@ -52,7 +52,7 @@ def _normalize_ws_url(url: str | None) -> str | None:
     return url
 
 
-from notebooklm_tools.core.exceptions import AuthenticationError  # noqa: E402
+from notebooklm_tools.core.exceptions import AuthenticationError, BrowserClosedError  # noqa: E402
 from notebooklm_tools.utils.config import get_base_url  # noqa: E402
 
 __all__ = [
@@ -648,6 +648,17 @@ def get_pages_by_cdp_url(cdp_http_url: str) -> list[dict]:
         return []
 
 
+def _cdp_target_is_available(cdp_http_url: str, ws_url: str) -> bool:
+    """Check whether the browser page target still exists."""
+    normalized_ws_url = _normalize_ws_url(ws_url)
+    pages = get_pages_by_cdp_url(cdp_http_url)
+    if not pages:
+        return False
+    return any(
+        _normalize_ws_url(page.get("webSocketDebuggerUrl")) == normalized_ws_url for page in pages
+    )
+
+
 def find_or_create_notebooklm_page_by_cdp_url(cdp_http_url: str) -> dict | None:
     """Find an existing NotebookLM page or create one on a given CDP endpoint."""
     pages = get_pages_by_cdp_url(cdp_http_url)
@@ -824,6 +835,217 @@ def navigate_to_url(ws_url: str, url: str) -> None:
     execute_cdp_command(ws_url, "Page.navigate", {"url": url})
 
 
+def _runtime_value(ws_url: str, expression: str) -> dict[str, Any]:
+    """Evaluate JavaScript and return the by-value result object."""
+    result = execute_cdp_command(
+        ws_url,
+        "Runtime.evaluate",
+        {"expression": expression, "returnByValue": True},
+    )
+    value = result.get("result", {}).get("value", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _google_login_ws_urls(cdp_http_url: str, fallback_ws_url: str) -> list[str]:
+    """Return candidate page websocket URLs that may host Google sign-in."""
+    candidates: list[str] = []
+
+    def add(ws_url: str | None) -> None:
+        normalized = _normalize_ws_url(ws_url)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    for page in get_pages_by_cdp_url(cdp_http_url):
+        url = page.get("url", "")
+        if "accounts.google.com" in url or "ServiceLogin" in url:
+            add(page.get("webSocketDebuggerUrl"))
+    add(fallback_ws_url)
+    return candidates
+
+
+def _click_google_identifier_next(ws_url: str) -> bool:
+    """Submit Google's identifier step using trusted CDP input when possible."""
+    button = _runtime_value(
+        ws_url,
+        """
+(() => {
+    const next = document.querySelector('#identifierNext button, #identifierNext [role="button"]');
+    if (!next) return { found: false };
+    next.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = next.getBoundingClientRect();
+    return {
+        found: true,
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+    };
+})()
+""",
+    )
+
+    if button.get("found") and button.get("x") is not None and button.get("y") is not None:
+        try:
+            x = float(button["x"])
+            y = float(button["y"])
+            execute_cdp_command(ws_url, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+            execute_cdp_command(
+                ws_url,
+                "Input.dispatchMouseEvent",
+                {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+            )
+            execute_cdp_command(
+                ws_url,
+                "Input.dispatchMouseEvent",
+                {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+            )
+            return True
+        except Exception:
+            pass
+
+    try:
+        _runtime_value(
+            ws_url,
+            """
+(() => {
+    const next = document.querySelector('#identifierNext button, #identifierNext [role="button"]');
+    if (next) {
+        next.click();
+        return { submitted: true };
+    }
+    return { submitted: false };
+})()
+""",
+        )
+        execute_cdp_command(
+            ws_url,
+            "Input.dispatchKeyEvent",
+            {"type": "rawKeyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13},
+        )
+        execute_cdp_command(
+            ws_url,
+            "Input.dispatchKeyEvent",
+            {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13},
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _prefill_google_identifier(ws_url: str, email: str, timeout: float = 10.0) -> bool:
+    """Fill Google's email identifier field via CDP, if it is visible.
+
+    The batch login flow never handles passwords. This only fills the public
+    email/phone identifier field and submits Google's identifier step, leaving
+    password entry to the user in the browser.
+    """
+    email_json = json.dumps(email)
+    selectors_js = """
+const selectors = [
+    '#identifierId',
+    'input[name="identifier"]',
+    'input[type="email"]',
+    'input[autocomplete*="username"]'
+];
+let input = null;
+for (const selector of selectors) {
+    input = document.querySelector(selector);
+    if (input) break;
+}
+"""
+    focus_script = f"""
+(() => {{
+    {selectors_js}
+    if (!input) return {{ ready: false, reason: 'missing', url: location.href, readyState: document.readyState }};
+    input.scrollIntoView({{ block: 'center', inline: 'center' }});
+    input.focus({{ preventScroll: true }});
+    input.click();
+    if (typeof input.select === 'function') input.select();
+    return {{ ready: true, value: input.value || '', active: document.activeElement === input }};
+}})()
+"""
+    clear_script = f"""
+(() => {{
+    {selectors_js}
+    if (!input) return {{ ready: false }};
+    input.focus({{ preventScroll: true }});
+    const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+    if (descriptor && descriptor.set) {{
+        descriptor.set.call(input, '');
+    }} else {{
+        input.value = '';
+    }}
+    input.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'deleteContentBackward', data: null }}));
+    return {{ ready: true, value: input.value || '' }};
+}})()
+"""
+    verify_script = f"""
+(() => {{
+    const email = {email_json};
+    {selectors_js}
+    if (!input) return {{ filled: false, reason: 'missing' }};
+    return {{ filled: (input.value || '').toLowerCase() === email.toLowerCase(), value: input.value || '' }};
+}})()
+"""
+    setter_script = f"""
+(() => {{
+    const email = {email_json};
+    {selectors_js}
+    if (!input) return {{ filled: false, reason: 'missing' }};
+    input.focus({{ preventScroll: true }});
+    const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+    if (descriptor && descriptor.set) {{
+        descriptor.set.call(input, email);
+    }} else {{
+        input.value = email;
+    }}
+    try {{
+        input.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: email }}));
+        input.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: email }}));
+    }} catch (_) {{
+        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    }}
+    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    return {{ filled: (input.value || '').toLowerCase() === email.toLowerCase(), value: input.value || '' }};
+}})()
+"""
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            focused = _runtime_value(ws_url, focus_script)
+            if not focused.get("ready"):
+                time.sleep(0.25)
+                continue
+
+            _runtime_value(ws_url, clear_script)
+            with contextlib.suppress(Exception):
+                execute_cdp_command(ws_url, "Input.insertText", {"text": email})
+
+            value = _runtime_value(ws_url, verify_script)
+            if not value.get("filled"):
+                value = _runtime_value(ws_url, setter_script)
+
+            if value.get("filled"):
+                _click_google_identifier_next(ws_url)
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _prefill_google_identifier_from_endpoint(
+    cdp_http_url: str, fallback_ws_url: str, email: str, timeout: float = 15.0
+) -> str | None:
+    """Try to prefill Google identifier on the active login target."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for ws_url in _google_login_ws_urls(cdp_http_url, fallback_ws_url):
+            if _prefill_google_identifier(ws_url, email, timeout=1.0):
+                return ws_url
+        time.sleep(0.25)
+    return None
+
+
 def _is_notebooklm_url(url: str) -> bool:
     """Check if a URL belongs to any NotebookLM domain (personal or enterprise)."""
     return "notebooklm.google.com" in url or "notebooklm.cloud.google.com" in url
@@ -901,6 +1123,7 @@ def extract_cookies_via_cdp(
     login_timeout: int = 300,
     profile_name: str = "default",
     clear_profile: bool = False,
+    login_hint: str | None = None,
 ) -> dict[str, Any]:
     """Extract cookies and tokens from Chrome via CDP.
 
@@ -913,6 +1136,7 @@ def extract_cookies_via_cdp(
         login_timeout: Max seconds to wait for login
         profile_name: NLM profile name (each gets its own Chrome user-data-dir)
         clear_profile: If True, delete the Chrome user-data-dir before launching
+        login_hint: Optional email address hint for Google's sign-in page
 
     Returns:
         Dict with cookies, csrf_token, session_id, and email
@@ -989,7 +1213,9 @@ def extract_cookies_via_cdp(
             message=f"Cannot connect to browser on port {port}",
             hint=hint,
         )
-    result = extract_cookies_from_page(_cdp_http_base(port), wait_for_login, login_timeout)
+    result = extract_cookies_from_page(
+        _cdp_http_base(port), wait_for_login, login_timeout, login_hint=login_hint
+    )
     result["reused_existing"] = reused_existing
     return result
 
@@ -998,6 +1224,7 @@ def extract_cookies_via_existing_cdp(
     cdp_url: str,
     wait_for_login: bool = True,
     login_timeout: int = 300,
+    login_hint: str | None = None,
 ) -> dict[str, Any]:
     """Extract auth cookies from an already-running Chrome CDP endpoint.
 
@@ -1017,13 +1244,24 @@ def extract_cookies_via_existing_cdp(
             message=f"Cannot connect to CDP endpoint: {cdp_http_url}",
             hint="Ensure the browser is running and CDP is reachable.",
         ) from e
-    return extract_cookies_from_page(cdp_http_url, wait_for_login, login_timeout)
+    return extract_cookies_from_page(
+        cdp_http_url, wait_for_login, login_timeout, login_hint=login_hint
+    )
+
+
+def _google_login_hint_url(email: str) -> str:
+    """Build a Google sign-in URL that pre-fills only the email address."""
+    return (
+        "https://accounts.google.com/ServiceLogin?"
+        f"continue={quote(NOTEBOOKLM_URL, safe='')}&login_hint={quote(email, safe='')}"
+    )
 
 
 def extract_cookies_from_page(
     cdp_http_url: str,
     wait_for_login: bool = True,
     login_timeout: int = 300,
+    login_hint: str | None = None,
 ) -> dict[str, Any]:
     page = find_or_create_notebooklm_page_by_cdp_url(cdp_http_url)
     if not page:
@@ -1047,6 +1285,13 @@ def extract_cookies_from_page(
     # Check login status
     current_url = get_current_url(ws_url)
 
+    if not is_logged_in(current_url) and wait_for_login and login_hint:
+        navigate_to_url(ws_url, _google_login_hint_url(login_hint))
+        login_ws_url = _prefill_google_identifier_from_endpoint(cdp_http_url, ws_url, login_hint)
+        if login_ws_url:
+            ws_url = login_ws_url
+        current_url = get_current_url(ws_url)
+
     if not is_logged_in(current_url) and wait_for_login:
         _logger.warning("Waiting for sign-in in browser window (timeout: %ds)...", login_timeout)
         start_time = time.time()
@@ -1058,7 +1303,8 @@ def extract_cookies_from_page(
                 if is_logged_in(current_url):
                     break
             except Exception:
-                pass
+                if not _cdp_target_is_available(cdp_http_url, ws_url):
+                    raise BrowserClosedError() from None
             elapsed = int(time.time() - start_time)
             if elapsed - last_log_at >= 30:
                 last_log_at = elapsed

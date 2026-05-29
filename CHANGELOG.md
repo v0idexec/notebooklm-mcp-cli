@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Safe email-only batch login** — Added `nlm login batch <accounts.txt>` to authenticate many Google accounts interactively from a text file containing one email per line. Profiles are named numerically, continuing after the highest existing numeric profile by default (`1`, `2`, `3`, ...), Google sign-in is opened with an email hint, and passwords are never read, stored, or typed by the CLI.
+- **Batch login email autofill** — When Google's `login_hint` parameter is ignored, the CLI now fills the visible `identifierId` / `identifier` email field via CDP trusted text input, resolves the active Google Accounts tab if needed, and clicks Next, while still leaving password entry manual.
+- **All-profiles login refresh** — Added `nlm login --all-profiles` / `nlm login --all` to refresh authentication for every saved profile in sequence using each profile's isolated browser session, with the same 10-second post-login close delay. Use `--start-index <n>` to begin from a specific numeric profile. Closing the auth browser before login completes now skips that profile and continues to the next one.
+
 ## [0.6.2] - 2026-04-29
 
 ### Fixed

@@ -28,6 +28,16 @@ class AuthenticationError(NLMError):
         super().__init__(message, hint)
 
 
+class BrowserClosedError(AuthenticationError):
+    """Raised when the auth browser or tab is closed before login completes."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            message="Browser window or tab was closed before login completed",
+            hint="The current profile can be skipped and retried later.",
+        )
+
+
 class NotFoundError(NLMError):
     """Raised when a requested resource is not found."""
 

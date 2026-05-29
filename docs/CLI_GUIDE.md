@@ -17,6 +17,8 @@ pip install notebooklm-mcp-cli
 ```bash
 nlm login                         # Opens browser, extracts cookies automatically
 nlm login --profile work          # Named profile for multiple accounts
+nlm login --all-profiles          # Refresh every saved profile in sequence
+nlm login batch accounts.txt      # Email-only batch login; profiles 1, 2, 3, ...
 nlm login --check                 # Check if authenticated
 nlm login switch <profile>        # Switch default profile
 nlm login profile list            # List all profiles with email addresses
@@ -28,6 +30,10 @@ nlm login --provider openclaw --cdp-url http://127.0.0.1:18800
 ```
 
 Each profile gets its own isolated browser session (supports Chrome, Arc, Brave, Edge, Chromium, and more), so you can stay logged into multiple Google accounts simultaneously.
+
+Use `nlm login --all-profiles` to refresh all saved profiles automatically. The CLI opens each profile's isolated browser session, waits for login if needed, saves fresh credentials, then waits 10 seconds before closing the browser. Add `--start-index <n>` to begin from a specific numeric profile, for example `nlm login --all --start-index 8`. If you close the auth browser before login completes, that profile is skipped and the CLI moves to the next one. Add `--stop-on-error` if you want the run to stop at the first failure.
+
+For batch login, the accounts file must contain one email per line only. Password columns are rejected; complete each Google sign-in manually in the browser window. Each run continues after the highest existing numeric profile by default; use `--start-index` to override.
 
 ## Command Structure
 

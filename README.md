@@ -270,6 +270,10 @@ nlm login --check
 # Use a named profile (for multiple Google accounts)
 nlm login --profile work
 nlm login --profile personal
+nlm login --all-profiles
+
+# Batch login from an email-only file; creates profiles 1, 2, 3, ...
+nlm login batch accounts.txt
 
 # Manual mode: import cookies from a file
 nlm login --manual --file cookies.txt
@@ -288,6 +292,10 @@ nlm login profile rename <old> <new> # Rename a profile
 ```
 
 Each profile gets its own isolated browser session, so you can be logged into multiple Google accounts simultaneously.
+
+Use `nlm login --all-profiles` to refresh authentication for every saved profile in sequence. It opens each saved profile's isolated browser session, waits for login if needed, saves fresh credentials, and keeps the browser open for 10 seconds after each successful login. Use `--start-index <n>` to begin from a specific numeric profile. If you close the auth browser before login completes, that profile is skipped and the CLI moves to the next one.
+
+Batch login files must contain one email per line only. Each run continues after the highest existing numeric profile by default. Passwords are never read or automated; complete Google sign-in manually in the browser.
 
 ### Standalone Auth Tool
 

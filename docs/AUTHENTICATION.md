@@ -108,6 +108,32 @@ nlm login profile rename work company
 nlm login profile delete old-profile
 ```
 
+To refresh every saved profile in sequence:
+
+```bash
+nlm login --all-profiles
+```
+
+This opens each saved profile's isolated browser session, waits for login if needed, saves fresh credentials, and keeps the browser open for 10 seconds after each successful login. Use `--start-index <n>` to begin from a specific numeric profile, such as `nlm login --all --start-index 8`. If you close the auth browser before login completes, that profile is skipped and the CLI moves to the next one. Use `--stop-on-error` to stop at the first failed profile. Passwords are never read, stored, or typed by the CLI.
+
+### Batch Login from an Email List
+
+For many accounts, create a text file with one email address per line:
+
+```text
+first@gmail.com
+second@gmail.com
+third@gmail.com
+```
+
+Then run:
+
+```bash
+nlm login batch accounts.txt
+```
+
+Profiles continue after the highest existing numeric profile by default. For example, if profiles `1` through `8` already exist, the next run starts at `9`. Use `--start-index` to choose a different starting number. Passwords are never read, stored, or typed by the CLI; each Google sign-in must be completed manually in the browser. Files containing password columns such as `email:password` are rejected.
+
 ### How Multi-Profile Works
 
 Each profile gets:
